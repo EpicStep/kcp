@@ -46,6 +46,7 @@ import (
 	kcptesting "github.com/kcp-dev/sdk/testing"
 	kcptestinghelpers "github.com/kcp-dev/sdk/testing/helpers"
 
+	"github.com/kcp-dev/kcp/test/e2e/fixtures/apifixtures"
 	"github.com/kcp-dev/kcp/test/e2e/fixtures/wildwest"
 	wildwestv1alpha1 "github.com/kcp-dev/kcp/test/e2e/fixtures/wildwest/apis/wildwest/v1alpha1"
 	wildwestclientset "github.com/kcp-dev/kcp/test/e2e/fixtures/wildwest/client/clientset/versioned/cluster"
@@ -413,6 +414,233 @@ func TestValidatingAdmissionPolicyCrossWorkspaceAPIBinding(t *testing.T) {
 	t.Logf("Verifying that creating good cowboy resource in target workspace succeeds")
 	_, err = cowbyClusterClient.Cluster(targetPath).WildwestV1alpha1().Cowboys("default").Create(ctx, newCowboy("good"), metav1.CreateOptions{})
 	require.NoError(t, err)
+}
+
+func TestValidatingAdmissionPolicyCrossWorkspaceAPIBindingClusterAnnotation(t *testing.T) {
+	t.Parallel()
+	framework.Suite(t, "control-plane")
+
+	server := kcptesting.SharedKcpServer(t)
+
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	t.Cleanup(cancelFunc)
+
+	cfg := server.BaseConfig(t)
+
+	orgPath, _ := kcptesting.NewWorkspaceFixture(t, server, core.RootCluster.Path(), kcptesting.WithType(core.RootCluster.Path(), "organization"))
+	providerPath, providerWS := kcptesting.NewWorkspaceFixture(t, server, orgPath)
+	consumerPath, consumerWS := kcptesting.NewWorkspaceFixture(t, server, orgPath)
+	providerCluster := logicalcluster.Name(providerWS.Spec.Cluster)
+	consumerCluster := logicalcluster.Name(consumerWS.Spec.Cluster)
+
+	kcpClusterClient, err := kcpclientset.NewForConfig(cfg)
+	require.NoError(t, err, "failed to construct kcp cluster client for server")
+
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(cfg)
+	require.NoError(t, err, "failed to construct client for server")
+
+	cowbyClusterClient, err := wildwestclientset.NewForConfig(cfg)
+	require.NoError(t, err, "failed to construct cowboy client for server")
+
+	exportName := createCowboysAPIExport(ctx, t, kcpClusterClient, providerPath)
+
+	for _, path := range []logicalcluster.Path{providerPath, consumerPath} {
+		t.Logf("Bind the cowboys export in workspace %q", path)
+		apifixtures.BindToExport(ctx, t, providerPath, exportName, path, kcpClusterClient)
+
+		require.Eventually(t, func() bool {
+			_, err := cowbyClusterClient.Cluster(path).WildwestV1alpha1().Cowboys("default").List(ctx, metav1.ListOptions{})
+			return err == nil
+		}, wait.ForeverTestTimeout, 100*time.Millisecond, "cowboys not served in workspace %q", path)
+	}
+
+	newCowboy := func(clusterAnnotation string) *wildwestv1alpha1.Cowboy {
+		c := &wildwestv1alpha1.Cowboy{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: "cowboy-",
+			},
+		}
+		if clusterAnnotation != "" {
+			c.Annotations = map[string]string{logicalcluster.AnnotationKey: clusterAnnotation}
+		}
+		return c
+	}
+
+	t.Logf("Create a cowboy in consumer workspace %q before the policy is bound", consumerPath)
+	existing, err := cowbyClusterClient.Cluster(consumerPath).WildwestV1alpha1().Cowboys("default").Create(ctx, newCowboy(""), metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	t.Logf("Install a policy into provider workspace %q that denies cowboys of consumer cluster %q", providerPath, consumerCluster)
+	const denyMessage = "cowboys are not allowed in the consumer workspace"
+	policy := &admissionregistrationv1.ValidatingAdmissionPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "policy-",
+		},
+		Spec: admissionregistrationv1.ValidatingAdmissionPolicySpec{
+			FailurePolicy: ptr.To(admissionregistrationv1.Fail),
+			MatchConstraints: &admissionregistrationv1.MatchResources{
+				ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{
+					{
+						RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+							Operations: []admissionregistrationv1.OperationType{
+								admissionregistrationv1.Create,
+								admissionregistrationv1.Update,
+							},
+							Rule: admissionregistrationv1.Rule{
+								APIGroups:   []string{wildwestv1alpha1.SchemeGroupVersion.Group},
+								APIVersions: []string{wildwestv1alpha1.SchemeGroupVersion.Version},
+								Resources:   []string{"cowboys"},
+							},
+						},
+					},
+				},
+			},
+			Validations: []admissionregistrationv1.Validation{{
+				Expression: fmt.Sprintf(`!has(object.metadata.annotations) || !(%q in object.metadata.annotations) || object.metadata.annotations[%q] != %q`,
+					logicalcluster.AnnotationKey, logicalcluster.AnnotationKey, consumerCluster),
+				Message: denyMessage,
+			}},
+		},
+	}
+	policy, err = kubeClusterClient.Cluster(providerPath).AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(ctx, policy, metav1.CreateOptions{})
+	require.NoError(t, err, "failed to create ValidatingAdmissionPolicy")
+	require.Eventually(t, func() bool {
+		p, err := kubeClusterClient.Cluster(providerPath).AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, policy.Name, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		return p.Generation == p.Status.ObservedGeneration && p.Status.TypeChecking != nil
+	}, wait.ForeverTestTimeout, 100*time.Millisecond)
+
+	binding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "binding-",
+		},
+		Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{
+			PolicyName:        policy.Name,
+			ValidationActions: []admissionregistrationv1.ValidationAction{admissionregistrationv1.Deny},
+		},
+	}
+	_, err = kubeClusterClient.Cluster(providerPath).AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Create(ctx, binding, metav1.CreateOptions{})
+	require.NoError(t, err, "failed to create ValidatingAdmissionPolicyBinding")
+
+	isDeniedByPolicy := func(err error) bool {
+		return errors.IsInvalid(err) && strings.Contains(err.Error(), denyMessage)
+	}
+
+	t.Logf("Verify that creating a cowboy in consumer workspace %q is denied", consumerPath)
+	require.Eventually(t, func() bool {
+		_, err := cowbyClusterClient.Cluster(consumerPath).WildwestV1alpha1().Cowboys("default").Create(ctx, newCowboy(""), metav1.CreateOptions{})
+		if isDeniedByPolicy(err) {
+			return true
+		}
+		t.Logf("Cowboy creation not yet denied by policy: %v", err)
+		return false
+	}, wait.ForeverTestTimeout, 1*time.Second)
+
+	t.Logf("Verify that a cowboy spoofing the provider cluster annotation is still denied in consumer workspace %q", consumerPath)
+	_, err = cowbyClusterClient.Cluster(consumerPath).WildwestV1alpha1().Cowboys("default").Create(ctx, newCowboy(providerCluster.String()), metav1.CreateOptions{})
+	require.Error(t, err)
+	require.True(t, isDeniedByPolicy(err), "expected denial by policy, got: %v", err)
+
+	t.Logf("Verify that an update spoofing the provider cluster annotation is denied in consumer workspace %q", consumerPath)
+	existing, err = cowbyClusterClient.Cluster(consumerPath).WildwestV1alpha1().Cowboys("default").Get(ctx, existing.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	if existing.Annotations == nil {
+		existing.Annotations = map[string]string{}
+	}
+	existing.Annotations[logicalcluster.AnnotationKey] = providerCluster.String()
+	existing.Spec.Intent = "updated"
+	_, err = cowbyClusterClient.Cluster(consumerPath).WildwestV1alpha1().Cowboys("default").Update(ctx, existing, metav1.UpdateOptions{})
+	require.Error(t, err)
+	require.True(t, isDeniedByPolicy(err), "expected denial by policy, got: %v", err)
+
+	t.Logf("Verify that creating a cowboy in provider workspace %q is allowed", providerPath)
+	kcptestinghelpers.Eventually(t, func() (bool, string) {
+		_, err := cowbyClusterClient.Cluster(providerPath).WildwestV1alpha1().Cowboys("default").Create(ctx, newCowboy(""), metav1.CreateOptions{})
+		return err == nil, fmt.Sprintf("error creating cowboy: %v", err)
+	}, wait.ForeverTestTimeout, 1*time.Second)
+}
+
+// createCowboysAPIExport creates a cowboys APIResourceSchema and an APIExport for it in the given workspace
+// and returns the name of the APIExport.
+func createCowboysAPIExport(ctx context.Context, t *testing.T, kcpClusterClient kcpclientset.ClusterInterface, path logicalcluster.Path) string {
+	t.Helper()
+
+	t.Logf("Install a cowboys APIResourceSchema into workspace %q", path)
+	apiResourceSchema := &apisv1alpha1.APIResourceSchema{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "today.cowboys.wildwest.dev",
+		},
+		Spec: apisv1alpha1.APIResourceSchemaSpec{
+			Group: "wildwest.dev",
+			Names: apiextensionsv1.CustomResourceDefinitionNames{
+				Kind:     "Cowboy",
+				ListKind: "CowboyList",
+				Plural:   "cowboys",
+				Singular: "cowboy",
+			},
+			Scope: "Namespaced",
+			Versions: []apisv1alpha1.APIResourceVersion{
+				{
+					Name:    "v1alpha1",
+					Served:  true,
+					Storage: true,
+					Schema: runtime.RawExtension{
+						Raw: []byte(`{
+							"description": "Cowboy is part of the wild west",
+							"properties": {
+								"apiVersion": {"type": "string"},
+								"kind": {"type": "string"},
+								"metadata": {"type": "object"},
+								"spec": {
+									"type": "object",
+									"properties": {
+										"intent": {"type": "string"}
+									}
+								},
+								"status": {
+									"type": "object",
+									"properties": {
+										"result": {"type": "string"}
+									}
+								}
+							},
+							"type": "object"
+						}`),
+					},
+					Subresources: apiextensionsv1.CustomResourceSubresources{
+						Status: &apiextensionsv1.CustomResourceSubresourceStatus{},
+					},
+				},
+			},
+		},
+	}
+	_, err := kcpClusterClient.Cluster(path).ApisV1alpha1().APIResourceSchemas().Create(ctx, apiResourceSchema, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	t.Logf("Create an APIExport for it")
+	export := &apisv1alpha2.APIExport{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cowboybebop",
+		},
+		Spec: apisv1alpha2.APIExportSpec{
+			Resources: []apisv1alpha2.ResourceSchema{
+				{
+					Name:   "cowboys",
+					Group:  "wildwest.dev",
+					Schema: apiResourceSchema.Name,
+					Storage: apisv1alpha2.ResourceSchemaStorage{
+						CRD: &apisv1alpha2.ResourceSchemaStorageCRD{},
+					},
+				},
+			},
+		},
+	}
+	_, err = kcpClusterClient.Cluster(path).ApisV1alpha2().APIExports().Create(ctx, export, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	return export.Name
 }
 
 // TODO: Currently ValidatingAdmissionPolicy with Params only works with single shard.

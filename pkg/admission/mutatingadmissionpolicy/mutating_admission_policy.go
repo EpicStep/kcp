@@ -25,6 +25,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/admission"
@@ -54,6 +55,7 @@ import (
 
 	"github.com/kcp-dev/kcp/pkg/admission/initializers"
 	"github.com/kcp-dev/kcp/pkg/admission/kubequota"
+	"github.com/kcp-dev/kcp/pkg/admission/validatingwebhook"
 	"github.com/kcp-dev/kcp/pkg/contextmanager"
 	kcpfeatures "github.com/kcp-dev/kcp/pkg/features"
 	"github.com/kcp-dev/kcp/pkg/reconciler/dynamicrestmapper"
@@ -231,6 +233,17 @@ func (k *KubeMutatingAdmissionPolicy) Admit(ctx context.Context, a admission.Att
 	delegate, err := k.getOrCreateDelegate(sourceCluster, cluster.Name)
 	if err != nil {
 		return err
+	}
+
+	if op := a.GetOperation(); op == admission.Create || op == admission.Update {
+		obj, ok := a.GetObject().(metav1.Object)
+		if !ok {
+			return fmt.Errorf("unexpected type %T", a.GetObject())
+		}
+
+		if undo := validatingwebhook.SetClusterAnnotation(obj, cluster.Name); undo != nil {
+			defer undo()
+		}
 	}
 
 	return delegate.Admit(ctx, a, o)

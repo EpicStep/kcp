@@ -134,6 +134,7 @@ func TestMutatingWebhookInWorkspace(t *testing.T) {
 			Rules: []admissionregistrationv1.RuleWithOperations{{
 				Operations: []admissionregistrationv1.OperationType{
 					admissionregistrationv1.Create,
+					admissionregistrationv1.Update,
 				},
 				Rule: admissionregistrationv1.Rule{
 					APIGroups:   []string{"wildwest.dev"},
@@ -175,6 +176,20 @@ func TestMutatingWebhookInWorkspace(t *testing.T) {
 		return true
 	}, wait.ForeverTestTimeout, 100*time.Millisecond)
 	require.Equal(t, 1, testWebhook.Calls(), "expected that the webhook is not called for logical cluster where webhook is not installed")
+
+	t.Logf("Updating cowboy resource in first logical cluster with a spoofed %s annotation", logicalcluster.AnnotationKey)
+	cowboys, err := cowbyClusterClient.Cluster(paths[0]).WildwestV1alpha1().Cowboys("default").List(ctx, metav1.ListOptions{})
+	require.NoError(t, err, "failed to list cowboys in first logical cluster")
+	require.NotEmpty(t, cowboys.Items, "expected a cowboy in first logical cluster")
+	spoofed := cowboys.Items[0].DeepCopy()
+	if spoofed.Annotations == nil {
+		spoofed.Annotations = map[string]string{}
+	}
+	spoofed.Annotations[logicalcluster.AnnotationKey] = workspaces[1].Spec.Cluster
+	_, err = cowbyClusterClient.Cluster(paths[0]).WildwestV1alpha1().Cowboys("default").Update(ctx, spoofed, metav1.UpdateOptions{})
+	require.NoError(t, err, "failed to update cowboy resource in first logical cluster")
+	require.GreaterOrEqual(t, testWebhook.Calls(), 2, "expected that the webhook is called on update")
+	require.Equal(t, workspaces[0].Spec.Cluster, clusterInReviewObject.Load(), "expected that the object passed to the webhook on update has the real kcp.io/cluster annotation set")
 }
 
 func TestValidatingWebhookInWorkspace(t *testing.T) {
@@ -261,6 +276,7 @@ func TestValidatingWebhookInWorkspace(t *testing.T) {
 			Rules: []admissionregistrationv1.RuleWithOperations{{
 				Operations: []admissionregistrationv1.OperationType{
 					admissionregistrationv1.Create,
+					admissionregistrationv1.Update,
 				},
 				Rule: admissionregistrationv1.Rule{
 					APIGroups:   []string{"wildwest.dev"},
@@ -297,4 +313,18 @@ func TestValidatingWebhookInWorkspace(t *testing.T) {
 	_, err = cowbyClusterClient.Cluster(paths[1]).WildwestV1alpha1().Cowboys("default").Create(ctx, &cowboy, metav1.CreateOptions{})
 	require.NoError(t, err, "failed to create cowboy resource in second logical cluster")
 	require.Equal(t, 1, testWebhook.Calls(), "expected that the webhook is not called for logical cluster where webhook is not installed")
+
+	t.Logf("Updating cowboy resource in first logical cluster with a spoofed %s annotation", logicalcluster.AnnotationKey)
+	cowboys, err := cowbyClusterClient.Cluster(paths[0]).WildwestV1alpha1().Cowboys("default").List(ctx, metav1.ListOptions{})
+	require.NoError(t, err, "failed to list cowboys in first logical cluster")
+	require.NotEmpty(t, cowboys.Items, "expected a cowboy in first logical cluster")
+	spoofed := cowboys.Items[0].DeepCopy()
+	if spoofed.Annotations == nil {
+		spoofed.Annotations = map[string]string{}
+	}
+	spoofed.Annotations[logicalcluster.AnnotationKey] = workspaces[1].Spec.Cluster
+	_, err = cowbyClusterClient.Cluster(paths[0]).WildwestV1alpha1().Cowboys("default").Update(ctx, spoofed, metav1.UpdateOptions{})
+	require.NoError(t, err, "failed to update cowboy resource in first logical cluster")
+	require.GreaterOrEqual(t, testWebhook.Calls(), 2, "expected that the webhook is called on update")
+	require.Equal(t, workspaces[0].Spec.Cluster, clusterInReviewObject.Load(), "expected that the object passed to the webhook on update has the real kcp.io/cluster annotation set")
 }

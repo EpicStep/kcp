@@ -128,12 +128,12 @@ func (p *Plugin) Validate(ctx context.Context, attr admission.Attributes, o admi
 		return fmt.Errorf("error validating ValidatingAdmissionWebhook initialization: %w", err)
 	}
 
-	// Add cluster annotation on create
-	if attr.GetOperation() == admission.Create {
+	if op := attr.GetOperation(); op == admission.Create || op == admission.Update {
 		u, ok := attr.GetObject().(metav1.Object)
 		if !ok {
 			return fmt.Errorf("unexpected type %T", attr.GetObject())
 		}
+
 		if undo := SetClusterAnnotation(u, clusterName); undo != nil {
 			defer undo()
 		}

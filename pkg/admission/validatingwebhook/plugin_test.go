@@ -94,3 +94,23 @@ func TestSetClusterAnnotation_AlreadySet(t *testing.T) {
 	assert.Nil(t, SetClusterAnnotation(in, clusterName))
 	assert.Equal(t, origAnnotations, in.GetAnnotations())
 }
+
+func TestSetClusterAnnotation_Spoofed(t *testing.T) {
+	t.Parallel()
+	in := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				logicalcluster.AnnotationKey: "other-cluster",
+				"foo":                        "bar",
+			},
+		},
+	}
+
+	undo := SetClusterAnnotation(in, clusterName)
+	require.NotNil(t, undo)
+	assert.Equal(t, clusterName.String(), in.GetAnnotations()[logicalcluster.AnnotationKey], "client-provided cluster annotation must be overwritten")
+
+	undo()
+
+	assert.Equal(t, map[string]string{"foo": "bar"}, in.GetAnnotations())
+}

@@ -44,6 +44,7 @@ import (
 	kcptesting "github.com/kcp-dev/sdk/testing"
 	kcptestinghelpers "github.com/kcp-dev/sdk/testing/helpers"
 
+	"github.com/kcp-dev/kcp/test/e2e/fixtures/apifixtures"
 	"github.com/kcp-dev/kcp/test/e2e/fixtures/wildwest"
 	wildwestv1alpha1 "github.com/kcp-dev/kcp/test/e2e/fixtures/wildwest/apis/wildwest/v1alpha1"
 	wildwestclientset "github.com/kcp-dev/kcp/test/e2e/fixtures/wildwest/client/clientset/versioned/cluster"
@@ -407,6 +408,134 @@ func TestMutatingAdmissionPolicyCrossWorkspaceAPIBinding(t *testing.T) {
 	good, err := cowbyClusterClient.Cluster(targetPath).WildwestV1alpha1().Cowboys("default").Create(ctx, newCowboy("good"), metav1.CreateOptions{})
 	require.NoError(t, err)
 	require.Equal(t, "good", good.Spec.Intent)
+}
+
+func TestMutatingAdmissionPolicyCrossWorkspaceAPIBindingClusterAnnotation(t *testing.T) {
+	t.Parallel()
+	framework.Suite(t, "control-plane")
+
+	server := kcptesting.SharedKcpServer(t)
+
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	t.Cleanup(cancelFunc)
+
+	cfg := server.BaseConfig(t)
+
+	orgPath, _ := kcptesting.NewWorkspaceFixture(t, server, core.RootCluster.Path(), kcptesting.WithType(core.RootCluster.Path(), "organization"))
+	providerPath, providerWS := kcptesting.NewWorkspaceFixture(t, server, orgPath)
+	consumerPath, consumerWS := kcptesting.NewWorkspaceFixture(t, server, orgPath)
+	providerCluster := logicalcluster.Name(providerWS.Spec.Cluster)
+	consumerCluster := logicalcluster.Name(consumerWS.Spec.Cluster)
+
+	kcpClusterClient, err := kcpclientset.NewForConfig(cfg)
+	require.NoError(t, err, "failed to construct kcp cluster client for server")
+
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(cfg)
+	require.NoError(t, err, "failed to construct client for server")
+
+	cowbyClusterClient, err := wildwestclientset.NewForConfig(cfg)
+	require.NoError(t, err, "failed to construct cowboy client for server")
+
+	exportName := createCowboysAPIExport(ctx, t, kcpClusterClient, providerPath)
+
+	t.Logf("Bind the cowboys export in consumer workspace %q", consumerPath)
+	apifixtures.BindToExport(ctx, t, providerPath, exportName, consumerPath, kcpClusterClient)
+	require.Eventually(t, func() bool {
+		_, err := cowbyClusterClient.Cluster(consumerPath).WildwestV1alpha1().Cowboys("default").List(ctx, metav1.ListOptions{})
+		return err == nil
+	}, wait.ForeverTestTimeout, 100*time.Millisecond)
+
+	const clusterLabel = "wildwest.dev/cluster"
+
+	t.Logf("Install a policy into provider workspace %q that labels cowboys with their logical cluster", providerPath)
+	policy := &admissionregistrationv1.MutatingAdmissionPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "policy-",
+		},
+		Spec: admissionregistrationv1.MutatingAdmissionPolicySpec{
+			FailurePolicy:      ptr.To(admissionregistrationv1.Fail),
+			ReinvocationPolicy: admissionregistrationv1.NeverReinvocationPolicy,
+			MatchConstraints: &admissionregistrationv1.MatchResources{
+				ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{
+					{
+						RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+							Operations: []admissionregistrationv1.OperationType{
+								admissionregistrationv1.Create,
+								admissionregistrationv1.Update,
+							},
+							Rule: admissionregistrationv1.Rule{
+								APIGroups:   []string{wildwestv1alpha1.SchemeGroupVersion.Group},
+								APIVersions: []string{wildwestv1alpha1.SchemeGroupVersion.Version},
+								Resources:   []string{"cowboys"},
+							},
+						},
+					},
+				},
+			},
+			Mutations: []admissionregistrationv1.Mutation{
+				{
+					PatchType: admissionregistrationv1.PatchTypeJSONPatch,
+					JSONPatch: &admissionregistrationv1.JSONPatch{
+						Expression: fmt.Sprintf(`[JSONPatch{op: "add", path: "/metadata/labels", value: {%q: object.metadata.annotations[%q]}}]`,
+							clusterLabel, logicalcluster.AnnotationKey),
+					},
+				},
+			},
+		},
+	}
+	policy, err = kubeClusterClient.Cluster(providerPath).AdmissionregistrationV1().MutatingAdmissionPolicies().Create(ctx, policy, metav1.CreateOptions{})
+	require.NoError(t, err, "failed to create MutatingAdmissionPolicy")
+
+	binding := &admissionregistrationv1.MutatingAdmissionPolicyBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "binding-",
+		},
+		Spec: admissionregistrationv1.MutatingAdmissionPolicyBindingSpec{
+			PolicyName: policy.Name,
+		},
+	}
+	_, err = kubeClusterClient.Cluster(providerPath).AdmissionregistrationV1().MutatingAdmissionPolicyBindings().Create(ctx, binding, metav1.CreateOptions{})
+	require.NoError(t, err, "failed to create MutatingAdmissionPolicyBinding")
+
+	newCowboy := func(clusterAnnotation string) *wildwestv1alpha1.Cowboy {
+		c := &wildwestv1alpha1.Cowboy{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: "cowboy-",
+			},
+		}
+		if clusterAnnotation != "" {
+			c.Annotations = map[string]string{logicalcluster.AnnotationKey: clusterAnnotation}
+		}
+		return c
+	}
+
+	t.Logf("Verify that a cowboy created in consumer workspace %q is labeled with cluster %q", consumerPath, consumerCluster)
+	var cowboy *wildwestv1alpha1.Cowboy
+	require.Eventually(t, func() bool {
+		var err error
+		cowboy, err = cowbyClusterClient.Cluster(consumerPath).WildwestV1alpha1().Cowboys("default").Create(ctx, newCowboy(""), metav1.CreateOptions{})
+		if err != nil {
+			t.Logf("Unexpected error when trying to create cowboy: %v", err)
+			return false
+		}
+		if cowboy.Labels[clusterLabel] != consumerCluster.String() {
+			t.Logf("Cowboy not yet mutated (labels=%v); the binding may not have propagated", cowboy.Labels)
+			return false
+		}
+		return true
+	}, wait.ForeverTestTimeout, 1*time.Second)
+
+	t.Logf("Verify that a cowboy spoofing the provider cluster annotation is still labeled with cluster %q", consumerCluster)
+	spoofed, err := cowbyClusterClient.Cluster(consumerPath).WildwestV1alpha1().Cowboys("default").Create(ctx, newCowboy(providerCluster.String()), metav1.CreateOptions{})
+	require.NoError(t, err)
+	require.Equal(t, consumerCluster.String(), spoofed.Labels[clusterLabel])
+
+	t.Logf("Verify that an update spoofing the provider cluster annotation is still labeled with cluster %q", consumerCluster)
+	cowboy.Annotations[logicalcluster.AnnotationKey] = providerCluster.String()
+	cowboy.Labels[clusterLabel] = "tampered"
+	updated, err := cowbyClusterClient.Cluster(consumerPath).WildwestV1alpha1().Cowboys("default").Update(ctx, cowboy, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	require.Equal(t, consumerCluster.String(), updated.Labels[clusterLabel])
 }
 
 // TODO: Currently MutatingAdmissionPolicy with Params only works with single shard, in the same way ValidatingAdmissionPolicy with Params does.
